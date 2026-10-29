@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""possess — haunted terminal CLI.
+
+Usage:
+    possess on                      start the daemon, enable whispering
+    possess off                     stop whispering (shell stops sending events)
+    possess status                  show enabled / haunt level / daemon state
+    possess haunt <1|2|3>           set haunt level (subtle / creepy / poltergeist)
+    possess ofrenda [--lang es]     print an ASCII ofrenda + ghost remembrance
+    possess send <json>             (internal) fire-and-forget a shell event to the daemon
+
+Standard library only. Config via ~/.config/possess/config.toml or environment:
+    POSSESS_MODEL, POSSESS_ENDPOINT, POSSESS_HAUNT, POSSESS_SOCKET, POSSESS_LANG
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+DAEMON_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, DAEMON_DIR)
+import possess_daemon as PD  # noqa: E402  (guarded by __main__)
+
+DAEMON_MODULE = os.path.join(DAEMON_DIR, "possess_daemon.py")
+STATE_FILE = os.path.join(os.path.expanduser("~"), ".local", "share", "possess", "state")
+WHISPER_FILE = os.path.join(os.path.expanduser("~"), ".local", "share", "possess", "last_whisper")
+DEFAULT_MODEL = os.environ.get("POSSESS_MODEL", "llama3.2:3b")
+DEFAULT_ENDPOINT = os.environ.get("POSSESS_ENDPOINT", "http://localhost:11434/v1")
+DEFAULT_HAUNT = int(os.environ.get("POSSESS_HAUNT", "2"))
+DEFAULT_LANG = os.environ.get("POSSESS_LANG", "en")
+
+
+def ensure_dirs():
+    os.makedirs(os.path.dirname(PD.WHISPER_FILE), exist_ok=True)
+
+
+def load_state():
+    state = {"enabled": "0", "haunt": str(DEFAULT_HAUNT)}
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    state[k.strip()] = v.strip()
+        except Exception:
+            pass
+    return state
+
+
+def save_state(**kwargs):
+    ensure_dirs()
+    state = load_state()
+    state.update(kwargs)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        for k in ("enabled", "haunt", "model", "endpoint", "lang"):
+            if k in state:
+                f.write(f"{k}={state[k]}\n")
+
+
+def daemon_running():
+    address = PD.socket_address()
+    try:
+        s = PD.client_socket()
+        s.settimeout(0.3)
+        s.connect(address)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+PID_FILE = os.path.join(os.path.expanduser("~"), ".local", "share", "possess", "daemon.pid")
+DAEMON_LOG = os.path.join(os.path.expanduser("~"), ".local", "share", "possess", "daemon.log")
+
+
+def start_daemon(model, endpoint, haunt, lang):
+    ensure_dirs()
+    if daemon_running():
+        return True
+    try:
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        log = open(DAEMON_LOG, "a", encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, DAEMON_MODULE,
+             "--model", model,
+             "--endpoint", endpoint,
+             "--haunt", str(haunt),
+             "--lang", lang],
+            stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+            cwd=DAEMON_DIR,
+            creationflags=creationflags,
+            start_new_session=(sys.platform != "win32"),
+        )
+        try:
+            with open(PID_FILE, "w", encoding="utf-8") as f:
+                f.write(str(proc.pid))
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[possess] could not start daemon: {e}", file=sys.stderr)
+        return False
+    # wait for the listen address to accept connections
+    for _ in range(30):
+        if daemon_running():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def stop_daemon():
+    address = PD.socket_address()
+    # Best-effort: tell the daemon to close by connecting (handler ignores unknown
+    # types but the connect confirms liveness), then kill the recorded PID.
+    try:
+        s = PD.client_socket()
+        s.settimeout(0.5)
+        s.connect(address)
+        s.sendall(b"\n")
+        s.close()
+    except Exception:
+        pass
+    try:
+        with open(PID_FILE, "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+        if sys.platform == "win32":
+            subprocess.call(["taskkill", "/PID", str(pid), "/F", "/T"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            os.kill(pid, 15)
+    except Exception:
+        pass
+    try:
+        os.remove(PID_FILE)
+    except Exception:
+        pass
+
+
+def socket_request(payload, timeout=3.0):
+    """Send a JSON payload to the daemon and return the parsed response (or None)."""
+    if not daemon_running():
+        return None
+    address = PD.socket_address()
+    try:
+        s = PD.client_socket()
+        s.settimeout(timeout)
+        s.connect(address)
+        s.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+        s.shutdown(socket.SHUT_WR)
+        buf = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        s.close()
+        if not buf:
+            return None
+        return json.loads(buf.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def socket_send_fire_forget(payload):
+    """Send an event to the daemon and return immediately (do not wait)."""
+    if not daemon_running():
+        return False
+    address = PD.socket_address()
+    try:
+        s = PD.client_socket()
+        s.settimeout(0.5)
+        s.connect(address)
+        s.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+        try:
+            s.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+def cmd_on(args):
+    model = os.environ.get("POSSESS_MODEL", DEFAULT_MODEL)
+    endpoint = os.environ.get("POSSESS_ENDPOINT", DEFAULT_ENDPOINT)
+    haunt = os.environ.get("POSSESS_HAUNT", str(DEFAULT_HAUNT))
+    lang = os.environ.get("POSSESS_LANG", DEFAULT_LANG)
+    ok = start_daemon(model, endpoint, haunt, lang)
+    save_state(enabled="1", haunt=str(max(1, min(3, int(haunt)))),
+               model=model, endpoint=endpoint, lang=lang)
+    if ok:
+        print("possess: daemon started. Whispering enabled (haunt level "
+              f"{max(1, min(3, int(haunt)))}).")
+    else:
+        print("possess: warning - daemon may not have started. Is Ollama running?",
+              file=sys.stderr)
+    return 0 if ok else 1
+
+
+def cmd_off(args):
+    save_state(enabled="0")
+    print("possess: whispering disabled. (Daemon still running; run 'possess on' to re-enable.)")
+    return 0
+
+
+def cmd_status(args):
+    state = load_state()
+    enabled = state.get("enabled", "0")
+    haunt = state.get("haunt", str(DEFAULT_HAUNT))
+    model = state.get("model", DEFAULT_MODEL)
+    running = daemon_running()
+    print(f"possess: enabled={enabled}")
+    print(f"         haunt level={haunt}  (1=subtle, 2=creepy, 3=poltergeist)")
+    print(f"         model={model}  endpoint={os.environ.get('POSSESS_ENDPOINT', DEFAULT_ENDPOINT)}")
+    print(f"         daemon={'running' if running else 'not running'}  address={PD.socket_address()}")
+    return 0
+
+
+def cmd_haunt(args):
+    if len(args) < 1:
+        print("possess: haunt requires a level 1-3", file=sys.stderr)
+        return 2
+    try:
+        level = int(args[0])
+    except ValueError:
+        print("possess: haunt level must be an integer 1-3", file=sys.stderr)
+        return 2
+    if level < 1 or level > 3:
+        print("possess: haunt level must be 1-3", file=sys.stderr)
+        return 2
+    state = load_state()
+    save_state(enabled=state.get("enabled", "1"), haunt=str(level),
+               model=state.get("model", DEFAULT_MODEL),
+               endpoint=state.get("endpoint", DEFAULT_ENDPOINT),
+               lang=state.get("lang", DEFAULT_LANG))
+    if daemon_running():
+        socket_request({"type": "haunt", "haunt": level}, timeout=2.0)
+    names = {1: "subtle", 2: "creepy", 3: "full poltergeist"}
+    print(f"possess: haunt level {level} ({names[level]}).")
+    return 0
+
+
+OFRENDA_ASCII = r"""
+       .                                                     .
+      / \                                                   / \
+     /   \                                               /   \
+    |  o  |                                             |  o  |
+     \ _ /                                               \ _ /
+      | |                                                   | |
+   ___| |___                                           ___| |___
+  /   | |   \                                         /   | |   \
+ |    | |    |                                       |    | |    |
+ |   /| | |\   \                                     /   /| | |\   |
+ |  / | | | \   \                                   /   / | | | \   |
+ | /  | | |  \   \                                 /   /  | | |  \   |
+ |    | | |    \   \                               /   /   | | |    \   |
+  \   | | |    /   /                               \   \   | | |    /   /
+   \  | | |   /   /                                 \  \   | | |   /   /
+    \ | | |  /   /                                   \ | | |  /   /
+     \| | | /   /                                     \| | | /   /
+      | | |/   /                                       | | |/   /
+      | |    /                                         | |    /
+      | |   /                                          | |   /
+      | |  /                                           | |  /
+      | | /                                            | | /
+      | |/                                             | |/
+      | |                                              | |
+      | |                                              | |
+   __(| |__)                                       __(| |__)
+  (________)                                     (_______)
+
+        __   __                                         __   __
+       /  \ /  \                                       /  \ /  \
+      |    O    |                                     |    O    |
+       \   ^   /                                       \   ^   /
+        \  -  /                                         \  -  /
+         \   /                                           \   /
+          \ /                                             \ /
+           V                                               V
+"""
+
+
+def ofrenda_remembrance_from_daemon(lang):
+    resp = socket_request({"type": "ofrenda", "lang": lang}, timeout=8.0)
+    if resp and resp.get("whisper"):
+        return resp["whisper"]
+    return None
+
+
+def local_ofrenda_remembrance(lang):
+    # Tender fallback based on generic session memory (daemon may be down).
+    if lang == "es":
+        return (
+            "Aqui reposan los comandos que ya no corren, los que murieron en el intento. "
+            "Que descansen en paz, pequeno espiritu de la maquina."
+        )
+    return (
+        "Here rest the commands that no longer run, the ones that died trying. "
+        "Rest in peace, little commands. The ghost remembers."
+    )
+
+
+def cmd_ofrenda(args):
+    lang = DEFAULT_LANG
+    i = 0
+    while i < len(args):
+        if args[i] == "--lang" and i + 1 < len(args):
+            lang = args[i + 1]
+            i += 2
+        elif args[i].startswith("--lang="):
+            lang = args[i].split("=", 1)[1]
+            i += 1
+        else:
+            i += 1
+    if lang not in ("en", "es"):
+        lang = "en"
+    print(OFRENDA_ASCII)
+    text = ofrenda_remembrance_from_daemon(lang)
+    if not text:
+        text = local_ofrenda_remembrance(lang)
+    print(text)
+    return 0
+
+
+def cmd_send(args):
+    # Internal: fire-and-forget a shell event to the daemon.
+    if len(args) < 1:
+        return 2
+    try:
+        event = json.loads(args[0])
+    except Exception:
+        return 2
+    socket_send_fire_forget(event)
+    return 0
+
+
+def main(argv=None):
+    argv = argv if argv is not None else sys.argv[1:]
+    if not argv:
+        print(__doc__)
+        return 0
+    cmd = argv[0]
+    rest = argv[1:]
+    if cmd == "on":
+        return cmd_on(rest)
+    if cmd == "off":
+        return cmd_off(rest)
+    if cmd == "status":
+        return cmd_status(rest)
+    if cmd == "haunt":
+        return cmd_haunt(rest)
+    if cmd == "ofrenda":
+        return cmd_ofrenda(rest)
+    if cmd == "send":
+        return cmd_send(rest)
+    print(f"possess: unknown command '{cmd}'", file=sys.stderr)
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
