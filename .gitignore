@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+.env
+
+# possess runtime (ephemeral — never commit whispers, sockets, state)
+*.sock
+*.log
+.last_whisper
+state
+/local/share/possess/
+
+# OS
+.DS_Store
+Thumbs.db

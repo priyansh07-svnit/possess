@@ -1,0 +1,9 @@
+# possess configuration.
+# Also overridable via environment variables:
+#   POSSESS_MODEL, POSSESS_ENDPOINT, POSSESS_HAUNT, POSSESS_SOCKET, POSSESS_LANG
+
+model = "llama3.2:3b"
+endpoint = "http://localhost:11434/v1"
+haunt = 2            # 1 = subtle, 2 = creepy, 3 = full poltergeist
+lang = "en"          # "en" or "es"
+socket = "$HOME/.local/share/possess/possess.sock"
